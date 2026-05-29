@@ -291,6 +291,50 @@ pub trait StellarFlowTrait {
     /// Return the expiry timestamp of the safety-checks bypass, or `None` if
     /// no bypass is currently set (regardless of whether it has expired).
     fn get_bypass_safety_checks_expiry(env: Env) -> Option<u64>;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Slashing — stake management & governance-gated slash
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Configure the SEP-41 token contract used for staking and slashing.
+    fn set_slash_token(env: Env, admin: Address, token: Address) -> Result<(), Error>;
+
+    /// Get the configured slash token address, if any.
+    fn get_slash_token(env: Env) -> Option<Address>;
+
+    /// Configure the ecosystem insurance reserve address that receives slashed funds.
+    fn set_insurance_reserve(env: Env, admin: Address, reserve: Address) -> Result<(), Error>;
+
+    /// Get the configured insurance reserve address, if any.
+    fn get_insurance_reserve(env: Env) -> Option<Address>;
+
+    /// Deposit stake tokens into the contract on behalf of a relayer.
+    ///
+    /// Tokens are transferred from the relayer's wallet into the contract's
+    /// custody and credited to their on-chain stake balance.
+    fn stake_tokens(env: Env, relayer: Address, amount: i128) -> Result<(), Error>;
+
+    /// Withdraw stake tokens from the contract back to the relayer.
+    fn unstake_tokens(env: Env, relayer: Address, amount: i128) -> Result<(), Error>;
+
+    /// Get the current staked balance for a relayer (in token stroops).
+    fn get_provider_stake(env: Env, relayer: Address) -> i128;
+
+    /// Governance-gated direct slash entry point.
+    ///
+    /// Transfers `amount` stroops from `bad_relayer`'s staked collateral into
+    /// the network's shared ecosystem insurance reserve. Requires the caller to
+    /// be an authorized admin.
+    ///
+    /// For multi-admin deployments, prefer the proposal pipeline
+    /// (`propose_action` with `action_type = 5`) so that multiple admins must
+    /// agree before funds are moved.
+    fn execute_slash(
+        env: Env,
+        executor: Address,
+        bad_relayer: Address,
+        amount: i128,
+    ) -> Result<(), Error>;
 }
 
 #[contractclient(name = "TokenContractClient")]
@@ -398,6 +442,19 @@ pub struct BypassEnabledEvent {
 #[soroban_sdk::contractevent]
 pub struct BypassDisabledEvent {
     pub admin: Address,
+}
+
+/// Emitted when a relayer's staked collateral is slashed by governance.
+#[soroban_sdk::contractevent]
+pub struct SlashExecutedEvent {
+    /// The relayer whose stake was slashed.
+    pub bad_relayer: Address,
+    /// The amount of tokens slashed (in token stroops).
+    pub amount: i128,
+    /// The insurance reserve address that received the slashed funds.
+    pub reserve: Address,
+    /// The admin who executed the slash.
+    pub executor: Address,
 }
 
 #[soroban_sdk::contractevent]
@@ -2193,6 +2250,7 @@ impl PriceOracle {
             2 => AdminAction::RemoveAdmin,
             3 => AdminAction::SelfDestruct,
             4 => AdminAction::Upgrade,
+            5 => AdminAction::Slash,
             _ => return Err(Error::InvalidActionType),
         };
 
@@ -2489,6 +2547,30 @@ impl PriceOracle {
                 env.events().publish(
                     (Symbol::new(&env, "contract_upgraded"),),
                     (executor.clone(),),
+                );
+            }
+            AdminAction::Slash => {
+                // The target field holds the bad relayer's address.
+                let bad_relayer = match proposed.target {
+                    Some(ref addr) => addr.clone(),
+                    None => return Err(Error::InvalidActionType),
+                };
+
+                // The data field encodes the slash amount as a decimal string.
+                let amount = crate::slashing::parse_slash_amount(&env, &proposed.data)?;
+
+                // Delegate to the slashing module.
+                crate::slashing::execute_slash_internal(&env, &executor, &bad_relayer, amount)?;
+
+                proposed.executed = true;
+                _log_admin_action(
+                    &env,
+                    &executor,
+                    AdminAction::Slash,
+                    Some(format!(
+                        "Slashed relayer: {}, amount: {}",
+                        bad_relayer, amount
+                    )),
                 );
             }
             _ => return Err(Error::InvalidActionType),
@@ -2800,6 +2882,216 @@ impl PriceOracle {
     pub fn get_bypass_safety_checks_expiry(env: Env) -> Option<u64> {
         crate::auth::_get_bypass_expiry(&env)
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Slashing — stake management & direct governance-gated slash
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Configure the SEP-41 token contract used for staking and slashing.
+    ///
+    /// Must be called by an authorized admin before any staking or slashing
+    /// operations can take place.
+    pub fn set_slash_token(env: Env, admin: Address, token: Address) -> Result<(), Error> {
+        _require_not_destroyed(&env);
+        _require_initialized(&env);
+        crate::auth::_require_not_frozen(&env);
+        admin.require_auth();
+        crate::auth::_require_authorized(&env, &admin);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SlashToken, &token);
+
+        _log_admin_action(
+            &env,
+            &admin,
+            AdminAction::SetSlashToken,
+            Some(token.to_string()),
+        );
+
+        env.events()
+            .publish((Symbol::new(&env, "slash_token_set"),), (admin, token));
+
+        Ok(())
+    }
+
+    /// Get the configured slash token address, if any.
+    pub fn get_slash_token(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::SlashToken)
+    }
+
+    /// Configure the ecosystem insurance reserve address.
+    ///
+    /// Slashed funds are transferred to this address. Must be set by an
+    /// authorized admin before any slash can be executed.
+    pub fn set_insurance_reserve(env: Env, admin: Address, reserve: Address) -> Result<(), Error> {
+        _require_not_destroyed(&env);
+        _require_initialized(&env);
+        crate::auth::_require_not_frozen(&env);
+        admin.require_auth();
+        crate::auth::_require_authorized(&env, &admin);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsuranceReserve, &reserve);
+
+        _log_admin_action(
+            &env,
+            &admin,
+            AdminAction::SetInsuranceReserve,
+            Some(reserve.to_string()),
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "insurance_reserve_set"),),
+            (admin, reserve),
+        );
+
+        Ok(())
+    }
+
+    /// Get the configured insurance reserve address, if any.
+    pub fn get_insurance_reserve(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::InsuranceReserve)
+    }
+
+    /// Deposit stake tokens into the contract on behalf of a relayer.
+    ///
+    /// The relayer must authorize this call. Tokens are transferred from the
+    /// relayer's wallet into the contract's custody and credited to their
+    /// on-chain stake balance.
+    ///
+    /// # Arguments
+    /// * `relayer` - The provider staking tokens (must provide auth)
+    /// * `amount`  - Number of token stroops to stake (must be > 0)
+    pub fn stake_tokens(env: Env, relayer: Address, amount: i128) -> Result<(), Error> {
+        _require_not_destroyed(&env);
+        _require_initialized(&env);
+        crate::auth::_require_not_frozen(&env);
+        relayer.require_auth();
+
+        if amount <= 0 {
+            return Err(Error::InvalidSlashAmount);
+        }
+
+        let token_address: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SlashToken)
+            .ok_or(Error::SlashTokenNotSet)?;
+
+        // Transfer tokens from the relayer into the contract.
+        let token_client = token::Client::new(&env, &token_address);
+        token_client.transfer(&relayer, &env.current_contract_address(), &amount);
+
+        // Credit the relayer's on-chain stake balance.
+        let current_stake: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProviderStake(relayer.clone()))
+            .unwrap_or(0);
+
+        let new_stake = current_stake.checked_add(amount).unwrap_or(current_stake);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProviderStake(relayer.clone()), &new_stake);
+
+        env.events().publish(
+            (Symbol::new(&env, "stake_deposited"),),
+            (relayer, amount, new_stake),
+        );
+
+        Ok(())
+    }
+
+    /// Withdraw stake tokens from the contract back to the relayer.
+    ///
+    /// The relayer must authorize this call. Only the portion of stake that
+    /// has not been slashed can be withdrawn.
+    ///
+    /// # Arguments
+    /// * `relayer` - The provider withdrawing tokens (must provide auth)
+    /// * `amount`  - Number of token stroops to withdraw (must be > 0 and ≤ stake)
+    pub fn unstake_tokens(env: Env, relayer: Address, amount: i128) -> Result<(), Error> {
+        _require_not_destroyed(&env);
+        _require_initialized(&env);
+        crate::auth::_require_not_frozen(&env);
+        relayer.require_auth();
+
+        if amount <= 0 {
+            return Err(Error::InvalidSlashAmount);
+        }
+
+        let token_address: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SlashToken)
+            .ok_or(Error::SlashTokenNotSet)?;
+
+        let current_stake: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProviderStake(relayer.clone()))
+            .unwrap_or(0);
+
+        if amount > current_stake {
+            return Err(Error::InsufficientStake);
+        }
+
+        let new_stake = current_stake - amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProviderStake(relayer.clone()), &new_stake);
+
+        // Return tokens to the relayer.
+        let token_client = token::Client::new(&env, &token_address);
+        token_client.transfer(&env.current_contract_address(), &relayer, &amount);
+
+        env.events().publish(
+            (Symbol::new(&env, "stake_withdrawn"),),
+            (relayer, amount, new_stake),
+        );
+
+        Ok(())
+    }
+
+    /// Get the current staked balance for a relayer.
+    pub fn get_provider_stake(env: Env, relayer: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ProviderStake(relayer))
+            .unwrap_or(0)
+    }
+
+    /// Governance-gated direct slash entry point.
+    ///
+    /// This is a convenience wrapper that lets an authorized admin execute a
+    /// slash without going through the full propose → vote → execute pipeline.
+    /// It still requires the caller to be an authorized admin and the contract
+    /// to be live (not destroyed, not frozen).
+    ///
+    /// For high-security deployments, prefer the proposal pipeline
+    /// (`propose_action` with `action_type = 5`) so that multiple admins must
+    /// agree before funds are moved.
+    ///
+    /// # Arguments
+    /// * `executor`    - Authorized admin executing the slash (must provide auth)
+    /// * `bad_relayer` - The relayer whose stake is being slashed
+    /// * `amount`      - Number of token stroops to slash (must be > 0 and ≤ stake)
+    pub fn execute_slash(
+        env: Env,
+        executor: Address,
+        bad_relayer: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        _require_not_destroyed(&env);
+        _require_initialized(&env);
+        crate::auth::_require_not_frozen(&env);
+        executor.require_auth();
+        crate::auth::_require_authorized(&env, &executor);
+
+        crate::slashing::execute_slash_internal(&env, &executor, &bad_relayer, amount)
+    }
 }
 
 mod asset_symbol;
@@ -2807,5 +3099,6 @@ mod auth;
 mod callbacks;
 pub mod math;
 mod median;
+mod slashing;
 mod test;
 mod types;

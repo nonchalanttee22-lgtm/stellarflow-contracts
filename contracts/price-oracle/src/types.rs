@@ -73,6 +73,12 @@ pub enum DataKey {
     PrevPriceFloorEntry(Symbol),
     /// Minimum number of votes required for a governance action to reach quorum.
     MinQuorumThreshold,
+    /// Staked collateral balance for a relayer/provider (i128, in token stroops).
+    ProviderStake(Address),
+    /// The SEP-41 token contract address used for staking and slashing.
+    SlashToken,
+    /// The address of the ecosystem insurance reserve that receives slashed funds.
+    InsuranceReserve,
 }
 
 /// Decimal metadata for an asset pair.
@@ -263,6 +269,12 @@ pub enum AdminAction {
     EnableBypassSafetyChecks,
     /// Admin disabled the safety-checks grace-period bypass
     DisableBypassSafetyChecks,
+    /// Governance-gated slash of a malicious relayer's staked collateral
+    Slash,
+    /// Admin set the insurance reserve address
+    SetInsuranceReserve,
+    /// Admin set the slash token address
+    SetSlashToken,
 }
 
 /// Admin log entry for tracking admin actions.
