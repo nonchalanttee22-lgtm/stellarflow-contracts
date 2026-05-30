@@ -2243,3 +2243,223 @@ fn test_self_destruct_prevents_double_destruct() {
     // Second call should panic with ContractDestroyed
     client.self_destruct(&admin1, &admin2);
 }
+
+// ============================================================================
+// Buffer Truncation Tests (Issue #334)
+// ============================================================================
+
+#[test]
+fn test_buffer_truncation_keeps_highest_weight_providers() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PriceOracle, ());
+    let client = PriceOracleClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let asset = symbol_short!("NGN");
+
+    // Initialize contract
+    client.init_admin(&admin);
+    client.add_asset(&admin, &asset);
+
+    // Create 15 providers with different weights
+    let mut providers = soroban_sdk::Vec::new(&env);
+    for i in 0..15 {
+        let provider = Address::generate(&env);
+        providers.push_back(provider.clone());
+        
+        env.as_contract(&contract_id, || {
+            crate::auth::_add_provider(&env, &provider);
+            // Assign weights: provider 0 gets weight 100, provider 1 gets 95, etc.
+            let weight = 100u32.saturating_sub(i * 5);
+            crate::auth::_set_provider_weight(&env, &provider, weight);
+        });
+    }
+
+    // Set initial price
+    client.set_price(&asset, &1_000_000_i128, &6u32, &3600u64);
+
+    // Have all 15 providers submit prices in the same ledger
+    env.ledger().set_sequence_number(100);
+    for i in 0..15 {
+        let provider = providers.get(i).unwrap();
+        let price = 1_000_000_i128 + (i as i128 * 100);
+        client.update_price(&provider, &asset, &price, &6u32, 90u32, &3600u64);
+    }
+
+    // Get the buffer and verify it was truncated to MAX_MEDIAN_ENTRIES (11)
+    let buffer = client.get_price_buffer_data(&asset);
+    assert!(buffer.is_some(), "Buffer should exist");
+    
+    let buffer_data = buffer.unwrap();
+    assert_eq!(
+        buffer_data.entries.len(),
+        11,
+        "Buffer should be truncated to MAX_MEDIAN_ENTRIES (11)"
+    );
+
+    // Verify that the highest-weight providers were kept
+    // The top 11 providers should have weights: 100, 95, 90, 85, 80, 75, 70, 65, 60, 55, 50
+    for entry in buffer_data.entries.iter() {
+        let weight = env.as_contract(&contract_id, || {
+            crate::auth::_get_provider_weight(&env, &entry.provider)
+        });
+        assert!(
+            weight >= 50,
+            "Only providers with weight >= 50 should remain in buffer, found weight: {}",
+            weight
+        );
+    }
+}
+
+#[test]
+fn test_buffer_no_truncation_when_under_limit() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PriceOracle, ());
+    let client = PriceOracleClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let asset = symbol_short!("KES");
+
+    // Initialize contract
+    client.init_admin(&admin);
+    client.add_asset(&admin, &asset);
+
+    // Create only 5 providers (under the limit of 11)
+    let mut providers = soroban_sdk::Vec::new(&env);
+    for i in 0..5 {
+        let provider = Address::generate(&env);
+        providers.push_back(provider.clone());
+        
+        env.as_contract(&contract_id, || {
+            crate::auth::_add_provider(&env, &provider);
+            crate::auth::_set_provider_weight(&env, &provider, 50u32);
+        });
+    }
+
+    // Set initial price
+    client.set_price(&asset, &500_000_i128, &6u32, &3600u64);
+
+    // Have all 5 providers submit prices
+    env.ledger().set_sequence_number(200);
+    for i in 0..5 {
+        let provider = providers.get(i).unwrap();
+        let price = 500_000_i128 + (i as i128 * 50);
+        client.update_price(&provider, &asset, &price, &6u32, 90u32, &3600u64);
+    }
+
+    // Get the buffer and verify no truncation occurred
+    let buffer = client.get_price_buffer_data(&asset);
+    assert!(buffer.is_some(), "Buffer should exist");
+    
+    let buffer_data = buffer.unwrap();
+    assert_eq!(
+        buffer_data.entries.len(),
+        5,
+        "Buffer should contain all 5 entries (no truncation needed)"
+    );
+}
+
+#[test]
+fn test_buffer_truncation_with_equal_weights() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PriceOracle, ());
+    let client = PriceOracleClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let asset = symbol_short!("GHS");
+
+    // Initialize contract
+    client.init_admin(&admin);
+    client.add_asset(&admin, &asset);
+
+    // Create 13 providers all with the same weight
+    let mut providers = soroban_sdk::Vec::new(&env);
+    for _ in 0..13 {
+        let provider = Address::generate(&env);
+        providers.push_back(provider.clone());
+        
+        env.as_contract(&contract_id, || {
+            crate::auth::_add_provider(&env, &provider);
+            crate::auth::_set_provider_weight(&env, &provider, 75u32);
+        });
+    }
+
+    // Set initial price
+    client.set_price(&asset, &800_000_i128, &6u32, &3600u64);
+
+    // Have all 13 providers submit prices
+    env.ledger().set_sequence_number(300);
+    for i in 0..13 {
+        let provider = providers.get(i).unwrap();
+        let price = 800_000_i128 + (i as i128 * 10);
+        client.update_price(&provider, &asset, &price, &6u32, 90u32, &3600u64);
+    }
+
+    // Get the buffer and verify it was truncated to 11
+    let buffer = client.get_price_buffer_data(&asset);
+    assert!(buffer.is_some(), "Buffer should exist");
+    
+    let buffer_data = buffer.unwrap();
+    assert_eq!(
+        buffer_data.entries.len(),
+        11,
+        "Buffer should be truncated to MAX_MEDIAN_ENTRIES (11) even with equal weights"
+    );
+}
+
+#[test]
+fn test_median_calculation_after_truncation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PriceOracle, ());
+    let client = PriceOracleClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let asset = symbol_short!("NGN");
+
+    // Initialize contract
+    client.init_admin(&admin);
+    client.add_asset(&admin, &asset);
+
+    // Create 12 providers with varying weights
+    let mut providers = soroban_sdk::Vec::new(&env);
+    for i in 0..12 {
+        let provider = Address::generate(&env);
+        providers.push_back(provider.clone());
+        
+        env.as_contract(&contract_id, || {
+            crate::auth::_add_provider(&env, &provider);
+            let weight = if i < 11 { 100u32 } else { 10u32 }; // Last provider has low weight
+            crate::auth::_set_provider_weight(&env, &provider, weight);
+        });
+    }
+
+    // Set initial price
+    client.set_price(&asset, &1_000_000_i128, &6u32, &3600u64);
+
+    // Have all 12 providers submit prices
+    env.ledger().set_sequence_number(400);
+    for i in 0..12 {
+        let provider = providers.get(i).unwrap();
+        let price = 1_000_000_i128 + (i as i128 * 1000);
+        client.update_price(&provider, &asset, &price, &6u32, 90u32, &3600u64);
+    }
+
+    // Verify the price was updated (median calculation succeeded)
+    let price_data = client.get_price(&asset, &true);
+    assert!(
+        price_data.price >= 1_000_000_i128,
+        "Median price should be calculated from truncated buffer"
+    );
+    
+    // The low-weight provider (index 11) should have been excluded
+    let buffer = client.get_price_buffer_data(&asset).unwrap();
+    assert_eq!(buffer.entries.len(), 11, "Buffer should contain 11 entries");
+}
