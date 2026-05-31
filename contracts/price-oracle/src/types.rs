@@ -129,6 +129,8 @@ pub struct PriceData {
     pub price: i128,
     /// Ledger timestamp when this price was written.
     pub timestamp: u64,
+    /// Exact ledger sequence number for this price write.
+    pub ledger_sequence: u32,
     /// Address that provided the price update.
     pub provider: Address,
     /// Number of decimals for the price value.

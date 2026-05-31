@@ -429,6 +429,8 @@ pub enum Error {
     InsufficientStake = 29,
     /// Missed-block infraction counts must be positive and in range.
     InvalidInfractionCount = 30,
+    /// A new price write is not allowed until the ledger advances past the previous write.
+    DuplicatePriceWriteInSameLedger = 31,
 }
 
 #[contract]
